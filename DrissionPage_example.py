@@ -666,28 +666,49 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # 借鉴 Turnstile-Solver 的外层点击策略：
-    # 1. 优先轮询 cf-turnstile-response 的值（有时扩展 + 页面自身就能自动通过）
-    # 2. 不再钻 Shadow Root / Iframe 内部找 Checkbox，而是直接点击外层容器
-    # 3. 同时尝试 JS API 调用 turnstile.execute() 作为辅助触发
+    # Grok 注册页面使用的是 Invisible Turnstile（无 checkbox，1x1 不可见 iframe），
+    # 正确处理方式：
+    # 1. 先等待一段时间，让 Turnstile 自动完成（auto-pass 场景）
+    # 2. 若未自动完成，提取 sitekey 并调用 turnstile.execute() 主动触发
+    # 3. 只轮询 cf-turnstile-response 的值，不要点击（点击会干扰 invisible 模式）
     try:
         page.run_js("try { if(window.turnstile) turnstile.reset(); } catch(e) { }")
     except Exception:
         pass
 
-    max_retries = 20
+    # 先给页面 3 秒，让 invisible Turnstile 有机会自动通过
+    time.sleep(3)
+
+    # 提取 sitekey，为 execute() 准备
+    sitekey = page.run_js("""
+        try {
+            // Grok 通常把 sitekey 放在 turnstile 配置里
+            var configs = window._cf_turnstile_options || [];
+            if (configs.length > 0) return configs[0].sitekey || null;
+            // 备选：从已有 widget container 中读
+            var el = document.querySelector('[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            // 备选：从 Turnstile API 对象中读
+            if (window.turnstile && window.turnstile._widgets) {
+                var widgets = Object.values(window.turnstile._widgets);
+                if (widgets.length > 0) return widgets[0].sitekey || null;
+            }
+            return null;
+        } catch(e) { return null; }
+    """)
+    if sitekey:
+        print(f"[*] 提取到 Turnstile sitekey: {sitekey[:20]}...")
+
+    max_retries = 25
     for i in range(max_retries):
         try:
-            # ── Step 1: 检查 cf-turnstile-response 是否已经有值 ──
-            # 借鉴 Turnstile-Solver 的 _get_turnstile_response：先查 input value
+            # ── 每次循环先检查是否已经有 token ──
             token_value = page.run_js("""
                 try {
-                    // 方式 A：通过 Turnstile JS API
                     if (window.turnstile) {
                         var resp = turnstile.getResponse();
                         if (resp) return resp;
                     }
-                    // 方式 B：直接读取隐藏 input 的值
                     var el = document.querySelector('[name="cf-turnstile-response"]');
                     if (el && el.value && el.value.trim()) return el.value.trim();
                     return null;
@@ -697,96 +718,57 @@ def getTurnstileToken():
                 print(f"[*] Turnstile 已通过，获取到 Token: {token_value[:30]}...")
                 return token_value
 
-            # ── Step 2: 尝试通过 JS API 主动触发 ──
+            # ── 调用 execute() 主动触发 invisible Turnstile ──
+            if i % 5 == 0:
+                print(f"[*] 等待 Turnstile 响应... (第 {i + 1}/{max_retries} 次)")
             page.run_js("""
                 try {
-                    if (window.turnstile) {
-                        // 尝试 execute，让 Turnstile 主动开始挑战
-                        var containers = document.querySelectorAll('.cf-turnstile');
+                    if (!window.turnstile) return;
+                    // 先尝试用 sitekey 重新 execute
+                    var sitekey = arguments[0];
+                    var el = document.querySelector('[name="cf-turnstile-response"]');
+                    var container = el ? el.parentElement : null;
+
+                    if (sitekey && container) {
+                        turnstile.execute(container, { sitekey: sitekey });
+                    } else {
+                        // fallback：对所有已知 widget 调用 execute
+                        var containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
                         if (containers.length > 0) {
                             turnstile.execute(containers[0]);
+                        } else if (container) {
+                            turnstile.execute(container);
                         }
                     }
                 } catch(e) { }
-            """)
-
-            # ── Step 3: 借鉴 Solver 的外层点击法 —— 直接点击 div.cf-turnstile 容器 ──
-            # Turnstile-Solver 的做法：page.click("//div[@class='cf-turnstile']")
-            # 这里用 DrissionPage 等价实现
-            turnstile_container = page.ele(".cf-turnstile", timeout=1)
-            if turnstile_container:
-                if i % 5 == 0:
-                    print(f"[*] 尝试点击 Turnstile 外层容器... (第 {i + 1}/{max_retries} 次)")
-                turnstile_container.click()
-            else:
-                # 如果 class 选择器找不到，尝试通过 cf-turnstile-response 的父级链定位
-                challenge_input = page.ele("@name=cf-turnstile-response", timeout=1)
-                if challenge_input:
-                    wrapper = challenge_input.parent()
-                    if wrapper:
-                        parent_of_wrapper = wrapper.parent()
-                        click_target = parent_of_wrapper or wrapper
-                        if i % 5 == 0:
-                            print(f"[*] 通过父级链定位，尝试点击 Turnstile 容器... (第 {i + 1}/{max_retries} 次)")
-                        click_target.click()
-                    else:
-                        if i % 5 == 0:
-                            print(f"[*] 等待 Turnstile 容器可用... (第 {i + 1}/{max_retries} 次)")
-                else:
-                    if i % 10 == 0:
-                        print(f"[*] 等待 Turnstile 组件加载... (第 {i + 1}/{max_retries} 次)")
-
-            # ── Step 4 (可选): 尝试在 Iframe 内注入 MouseEvent 补丁 ──
-            # 保留对 iframe 的 screenX/Y 注入，但不再依赖是否成功
-            try:
-                challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.5)
-                if challenge_input:
-                    wrapper = challenge_input.parent()
-                    if wrapper:
-                        sr = wrapper.shadow_root
-                        if sr:
-                            iframe = sr.ele("tag:iframe", timeout=0.5)
-                            if iframe:
-                                iframe.run_js("""
-                                    try {
-                                        if (!window.MouseEvent.prototype.hasOwnProperty('_mocked')) {
-                                            const getRandomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-                                            let sX = getRandomInt(800, 1200);
-                                            let sY = getRandomInt(400, 600);
-                                            Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sX });
-                                            Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sY });
-                                            MouseEvent.prototype._mocked = true;
-                                        }
-                                    } catch(e) {}
-                                """)
-            except Exception:
-                pass
+            """, sitekey)
 
         except Exception as e:
             if i % 5 == 0:
                 print(f"[Debug] Turnstile 尝试中遇到异常: {e}")
 
-        time.sleep(1.5)
+        time.sleep(2)
 
     # 超时后输出 DOM 快照帮助排查
     try:
         debug_info = page.run_js("""
             var el = document.querySelector('[name="cf-turnstile-response"]');
-            var containers = document.querySelectorAll('.cf-turnstile');
+            var containers = document.querySelectorAll('[data-sitekey], .cf-turnstile');
             return {
                 url: location.href,
                 hasTurnstileInput: !!el,
-                turnstileInputValue: el ? (el.value || '').substring(0, 30) : '',
+                turnstileInputValue: el ? (el.value || '').substring(0, 50) : '',
                 containerCount: containers.length,
                 hasTurnstileAPI: !!window.turnstile,
-                iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({src: f.src || '', width: f.width, height: f.height})).slice(0, 5)
+                widgetCount: window.turnstile && window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 0,
+                iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({src: (f.src||'').substring(0,80), width: f.width, height: f.height})).slice(0, 5)
             };
         """)
         print(f"[Debug] Turnstile 超时，DOM 快照: {debug_info}")
     except Exception:
         pass
 
-    raise Exception("Turnstile 验证超时，30 秒内未获取到 Token")
+    raise Exception("Turnstile 验证超时，未获取到 Token")
 
 
 def build_profile():
