@@ -1,0 +1,12 @@
+services:
+  grok-register:
+    build: .
+    container_name: grok-register
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./sso:/app/sso
+      - ./logs:/app/logs
+    environment:
+      - DISPLAY=:99
+      - USE_XVFB=1
+    restart: unless-stopped
