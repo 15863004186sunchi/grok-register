@@ -711,239 +711,98 @@ def fill_profile_and_submit(timeout=30):
     deadline = time.time() + timeout
     turnstile_token = ""
 
+def fill_profile_and_submit(timeout=45):
+    # 使用原生输入模拟替代 JS 暴力设置，确保 React/Next.js 状态同步。
+    given_name, family_name, password = build_profile()
+    deadline = time.time() + timeout
+    turnstile_token = ""
+
+    print(f"[*] 开始填写注册资料 (超时: {timeout}s)...")
     while time.time() < deadline:
-        filled = page.run_js(
-            """
-const givenName = arguments[0];
-const familyName = arguments[1];
-const password = arguments[2];
-
-function isVisible(node) {
-    if (!node) {
-        return false;
-    }
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-        return false;
-    }
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function pickInput(selector) {
-    return Array.from(document.querySelectorAll(selector)).find((node) => {
-        return isVisible(node) && !node.disabled && !node.readOnly;
-    }) || null;
-}
-
-function setInputValue(input, value) {
-    if (!input) {
-        return false;
-    }
-    input.focus();
-    input.click();
-
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) {
-        tracker.setValue('');
-    }
-
-    if (nativeSetter) {
-        nativeSetter.call(input, '');
-        nativeSetter.call(input, value);
-    } else {
-        input.value = '';
-        input.value = value;
-    }
-
-    input.dispatchEvent(new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        data: value,
-        inputType: 'insertText',
-    }));
-    input.dispatchEvent(new InputEvent('input', {
-        bubbles: true,
-        cancelable: true,
-        data: value,
-        inputType: 'insertText',
-    }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('blur', { bubbles: true }));
-
-    return String(input.value || '') === String(value || '');
-}
-
-const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
-const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
-const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
-
-if (!givenInput || !familyInput || !passwordInput) {
-    return 'not-ready';
-}
-
-const givenOk = setInputValue(givenInput, givenName);
-const familyOk = setInputValue(familyInput, familyName);
-const passwordOk = setInputValue(passwordInput, password);
-
-if (!givenOk || !familyOk || !passwordOk) {
-    return 'filled-failed';
-}
-
-return [
-    String(givenInput.value || '').trim() === String(givenName || '').trim(),
-    String(familyInput.value || '').trim() === String(familyName || '').trim(),
-    String(passwordInput.value || '') === String(password || ''),
-].every(Boolean) ? 'filled' : 'verify-failed';
-            """,
-            given_name,
-            family_name,
-            password,
-        )
-
-        if filled == 'not-ready':
-            time.sleep(0.5)
-            continue
-
-        if filled != 'filled':
-            print(f"[Debug] 最终注册页输入框已出现，但姓名/密码写入失败: {filled}")
-            time.sleep(0.5)
-            continue
-
-        values_ok = page.run_js(
-            """
-const expectedGiven = arguments[0];
-const expectedFamily = arguments[1];
-const expectedPassword = arguments[2];
-
-function isVisible(node) {
-    if (!node) {
-        return false;
-    }
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-        return false;
-    }
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function pickInput(selector) {
-    return Array.from(document.querySelectorAll(selector)).find((node) => {
-        return isVisible(node) && !node.disabled && !node.readOnly;
-    }) || null;
-}
-
-const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
-const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
-const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"]');
-
-if (!givenInput || !familyInput || !passwordInput) {
-    return false;
-}
-
-return String(givenInput.value || '').trim() === String(expectedGiven || '').trim()
-    && String(familyInput.value || '').trim() === String(expectedFamily || '').trim()
-    && String(passwordInput.value || '') === String(expectedPassword || '');
-            """,
-            given_name,
-            family_name,
-            password,
-        )
-        if not values_ok:
-            print("[Debug] 最终注册页字段值校验失败，继续重试填写。")
-            time.sleep(0.5)
-            continue
-
-        turnstile_state = page.run_js(
-            """
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!challengeInput) {
-    return 'not-found';
-}
-const value = String(challengeInput.value || '').trim();
-return value ? 'ready' : 'pending';
-            """
-        )
-
-        if turnstile_state == "pending" and not turnstile_token:
-            print("[*] 检测到最终注册页存在 Turnstile，开始使用现有真人化点击逻辑。")
-            turnstile_token = getTurnstileToken()
-            if turnstile_token:
-                synced = page.run_js(
-                    """
-const token = arguments[0];
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!challengeInput) {
-    return false;
-}
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) {
-    nativeSetter.call(challengeInput, token);
-} else {
-    challengeInput.value = token;
-}
-challengeInput.dispatchEvent(new Event('input', { bubbles: true }));
-challengeInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(challengeInput.value || '').trim() === String(token || '').trim();
-                    """,
-                    turnstile_token,
-                )
-                if synced:
-                    print("[*] Turnstile 响应已同步到最终注册表单。")
-
-        time.sleep(1.2)
-
+        # 1. 定位输入框
         try:
-            submit_button = page.ele('tag:button@@text()=完成注册') or page.ele('tag:button@@text():Create Account') or page.ele('tag:button@@text():Sign up')
-        except Exception:
-            submit_button = None
+            given_el = page.ele('css:input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]', timeout=3)
+            family_el = page.ele('css:input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]', timeout=2)
+            pass_el = page.ele('css:input[data-testid="password"], input[name="password"], input[type="password"]', timeout=2)
+            
+            if not (given_el and family_el and pass_el):
+                print("[Debug] 正在等待注册输入框出现...")
+                time.sleep(1)
+                continue
+            
+            # 2. 模拟真实输入
+            print(f"[*] 模拟输入: {given_name} {family_name}")
+            given_el.clear(); given_el.input(given_name)
+            family_el.clear(); family_el.input(family_name)
+            pass_el.clear(); pass_el.input(password)
+            
+            # 3. 校验输入内容是否持久化
+            if not (given_el.value == given_name and family_el.value == family_name):
+                print("[Warn] 字段值校验不通过，尝试重新模拟输入...")
+                time.sleep(0.5)
+                continue
+                
+            # 4. 处理 Turnstile (如果存在)
+            turnstile_state = page.run_js(
+                """
+const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!challengeInput) return 'not-found';
+return String(challengeInput.value || '').trim() ? 'ready' : 'pending';
+                """
+            )
 
-        if not submit_button:
-            clicked = page.run_js(
-                r"""
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (challengeInput && !String(challengeInput.value || '').trim()) {
-    return false;
+            if turnstile_state == "pending" and not turnstile_token:
+                print("[*] 检测到 Turnstile 尚未完成，正在申请解决...")
+                turnstile_token = getTurnstileToken()
+                if turnstile_token:
+                    page.run_js(
+                        """
+const token = arguments[0];
+const inp = document.querySelector('input[name="cf-turnstile-response"]');
+if (inp) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(inp, token); else inp.value = token;
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    inp.dispatchEvent(new Event('change', { bubbles: true }));
 }
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
-const submitButton = buttons.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const t = text.toLowerCase(); return text === '完成注册' || text.includes('完成注册') || t.includes('create account') || t.includes('sign up') || t.includes('complete');
-});
-if (!submitButton || submitButton.disabled || submitButton.getAttribute('aria-disabled') === 'true') {
-    return false;
-}
-submitButton.focus();
-submitButton.click();
-return true;
-                """
-            )
-        else:
-            challenge_value = page.run_js(
-                """
-const challengeInput = document.querySelector('input[name="cf-turnstile-response"]');
-return challengeInput ? String(challengeInput.value || '').trim() : 'not-found';
-                """
-            )
-            if challenge_value not in ('not-found', ''):
-                submit_button.click()
-                clicked = True
+                        """,
+                        turnstile_token
+                    )
+                    print("[*] Turnstile 令牌已注入。")
+
+            # 5. 寻找并点击提交按钮
+            btn = (page.ele('tag:button@@text()=完成注册') or 
+                   page.ele('tag:button@@text():Create Account') or 
+                   page.ele('tag:button@@text():Sign up') or
+                   page.ele('css:button[type="submit"]'))
+            
+            if btn and not btn.attr('disabled'):
+                btn.click()
+                print(f"[*] 已点击完成注册: {given_name} {family_name} / {password}")
+                
+                # ── 增加即时快照：点击后 2s 存现场 ──
+                time.sleep(2)
+                try:
+                    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+                    os.makedirs(log_dir, exist_ok=True)
+                    page.get_screenshot(path=os.path.join(log_dir, "post_click_stage.png"), full_page=True)
+                    print("[Debug] 已保存点击后实时快照: logs/post_click_stage.png")
+                except: pass
+                
+                return {
+                    "given_name": given_name,
+                    "family_name": family_name,
+                    "password": password,
+                }
             else:
-                clicked = False
+                print("[Debug] 注册按钮尚未处于可点击状态...")
 
-        if clicked:
-            print(f"[*] 已填写注册资料并点击完成注册: {given_name} {family_name} / {password}")
-            return {
-                "given_name": given_name,
-                "family_name": family_name,
-                "password": password,
-            }
+        except Exception as e:
+            print(f"[Debug] 填写表单异常: {e}")
 
-        time.sleep(0.5)
+        time.sleep(1.5)
 
-    raise Exception("未找到最终注册表单或完成注册按钮")
+    raise Exception("未能在超时时间内完成资料填写或提交")
 
 
 def extract_visible_numbers(timeout=60):
