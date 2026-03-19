@@ -17,7 +17,7 @@ class TurnstileService:
         if not self.api_key:
             raise Exception("缺少 YESCAPTCHA_KEY（可通过环境变量或 config.json 配置）")
 
-    def create_task(self, site_url: str, site_key: str) -> str:
+    def create_task(self, site_url: str, site_key: str, action: str = None, data: str = None) -> str:
         """提交验证任务，返回 task_id"""
         payload = {
             "clientKey": self.api_key,
@@ -28,13 +28,18 @@ class TurnstileService:
             },
             "softID": YESCAPTCHA_SOFT_ID,
         }
+        if action:
+            payload["task"]["pageAction"] = action
+        if data:
+            payload["task"]["pageData"] = data
+            
         resp = requests.post(f"{self.api_base}/createTask", json=payload, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
-        if data.get('errorId') != 0:
-            raise Exception(f"YesCaptcha 创建任务失败: {data.get('errorDescription')}")
-        task_id = data['taskId']
-        print(f"[YesCaptcha] 任务已提交: {task_id}")
+        data_resp = resp.json()
+        if data_resp.get('errorId') != 0:
+            raise Exception(f"YesCaptcha 创建任务失败: {data_resp.get('errorDescription')}")
+        task_id = data_resp['taskId']
+        print(f"[YesCaptcha] 任务已提交: {task_id} (action={action})")
         return task_id
 
     def get_response(self, task_id: str, max_retries: int = 30,
@@ -73,7 +78,7 @@ class TurnstileService:
         print("[YesCaptcha] 超时，未获取到 token")
         return None
 
-    def solve(self, site_url: str, site_key: str) -> str | None:
+    def solve(self, site_url: str, site_key: str, action: str = None, data: str = None) -> str | None:
         """一步完成：提交任务 + 等待结果"""
-        task_id = self.create_task(site_url, site_key)
+        task_id = self.create_task(site_url, site_key, action=action, data=data)
         return self.get_response(task_id)

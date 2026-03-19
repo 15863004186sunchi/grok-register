@@ -670,7 +670,7 @@ return { url: location.href, inputs, buttons };
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
-def getTurnstileToken():
+def getTurnstileToken(action=None, data=None):
     """
     通过 YesCaptcha API 解决 Turnstile 验证，无需浏览器点击。
     Sitekey: 0x4AAAAAAAhr9JGVDZbrZOo0
@@ -678,11 +678,17 @@ def getTurnstileToken():
     """
     SITE_URL = "https://accounts.x.ai"
     SITE_KEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
+    
+    # 获取保底 Action 和 Data (参考 grok.py)
+    # Action 通常为 'signup'
+    # Data 通常为 Next.js 的 state tree
+    final_action = action or "signup"
+    final_data = data or "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 
-    print("[Turnstile] 正在通过 YesCaptcha 解决验证...")
+    print(f"[Turnstile] 正在通过 YesCaptcha 解决验证 (action={final_action})...")
     try:
         service = TurnstileService()
-        token = service.solve(SITE_URL, SITE_KEY)
+        token = service.solve(SITE_URL, SITE_KEY, action=final_action, data=final_data)
         if token:
             return token
         raise Exception("YesCaptcha 返回了空 Token")
@@ -753,7 +759,9 @@ return String(challengeInput.value || '').trim() ? 'ready' : 'pending';
 
             if turnstile_state == "pending" and not turnstile_token:
                 print("[*] 检测到 Turnstile 尚未完成，正在申请解决...")
-                turnstile_token = getTurnstileToken()
+                # 尝试从页面获取 action (通常是 signup)
+                page_action = page.run_js("return window.__cf_chl_opt?.action || 'signup'")
+                turnstile_token = getTurnstileToken(action=page_action)
                 if turnstile_token:
                     page.run_js(
                         """
@@ -765,10 +773,22 @@ if (inp) {
     inp.dispatchEvent(new Event('input', { bubbles: true }));
     inp.dispatchEvent(new Event('change', { bubbles: true }));
 }
+// 强制覆盖 Turnstile API 返回值，防止 JS 校验失败
+if (window.turnstile) {
+    const originalGetResponse = window.turnstile.getResponse;
+    window.turnstile.getResponse = function() { return token; };
+}
+// 尝试触发可能的 Success Callback (启发式搜索)
+try {
+    const callbackName = window.__cf_chl_opt?.c || window.turnstile_callback;
+    if (callbackName && typeof window[callbackName] === 'function') {
+        window[callbackName](token);
+    }
+} catch(e) {}
                         """,
                         turnstile_token
                     )
-                    print("[*] Turnstile 令牌已注入。")
+                    print("[*] Turnstile 令牌已注入并覆盖 API。")
 
             # 5. 寻找并点击提交按钮
             btn = (page.ele('tag:button@@text()=完成注册') or 
