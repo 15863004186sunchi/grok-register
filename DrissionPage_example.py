@@ -1103,6 +1103,9 @@ def fill_profile_and_submit(verify_code, email):
     # 5. 执行 Hybrid 注册 (JS Fetch)
     print(f"[*] 正在通过浏览器环境模拟 API 注册: {email}")
     
+    # 防止 action_id 为 None 导致 run_js 报错
+    final_action_id = action_id or ""
+    
     state_tree = "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
     
     fetch_js = """
@@ -1129,7 +1132,7 @@ def fill_profile_and_submit(verify_code, email):
     }).then(r => r.text()).catch(e => "FETCH_ERROR: " + e.message);
     """
     
-    response_text = page.run_js(fetch_js, verify_code, email, first_name, last_name, password, turnstile_token, state_tree, action_id)
+    response_text = page.run_js(fetch_js, verify_code, email, first_name, last_name, password, turnstile_token, state_tree, final_action_id)
     
     if "FETCH_ERROR" in response_text:
         raise Exception(f"注册 Fetch 失败: {response_text}")
