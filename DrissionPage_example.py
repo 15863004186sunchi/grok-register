@@ -667,53 +667,35 @@ return { url: location.href, inputs, buttons };
 
 def getTurnstileToken():
     # Grok 注册页面的 Turnstile 处理策略：
-    # 1. 使用用户提供的硬编码 Sitekey 作为保底：0x4AAAAAAAhr9JGVDZbrZOo0
-    # 2. 如果页面未自动渲染 Widget (widgetCount: 0)，则强制调用 turnstile.render()
-    # 3. 轮询 token，不点击（针对 invisible 模式优化）
+    # 1. 使用用户提供的硬编码 Sitekey: 0x4AAAAAAAhr9JGVDZbrZOo0
+    # 2. 如果 widgetCount 为 0，手动提取并运行脚本 URL 中的 onload 回调函数
+    # 3. 强制调用 turnstile.render() 并在出错时记录具体 Error 对象
 
     HARDCODED_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 
-    # ── 初始化：Reset + 诊断日志 ──
     print("[Turnstile] 正在初始化验证组件...")
-    reset_result = page.run_js("""
+    # ── 1. 尝试触发 onload 回调 (补足无头环境下的初始化缺失) ──
+    init_status = page.run_js("""
         try {
-            if (window.turnstile) { try { turnstile.reset(); } catch(e){} }
-            var widgets = window.turnstile && window.turnstile._widgets
-                ? Object.keys(window.turnstile._widgets).length : 0;
-            var containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]').length;
-            return { hadAPI: !!window.turnstile, widgetCount: widgets, containerCount: containers };
+            var scripts = Array.from(document.querySelectorAll('script[src*="turnstile"]'));
+            var onload = null;
+            for (var s of scripts) {
+                var m = s.src.match(/[?&]onload=([A-Za-z0-9_]+)/);
+                if (m) { onload = m[1]; break; }
+            }
+            if (onload && window[onload]) {
+                window[onload]();
+                return { action: 'trigger_onload', func: onload, status: 'called' };
+            }
+            return { action: 'trigger_onload', status: 'not_found' };
         } catch(e) { return { error: String(e) }; }
     """)
-    print(f"[Turnstile] 初始状态: {reset_result}")
-
-    # ── 提取 sitekey ──
-    sitekey_info = page.run_js("""
-        try {
-            var sitekey = null;
-            var configs = window._cf_turnstile_options || [];
-            if (configs.length > 0 && configs[0].sitekey) sitekey = configs[0].sitekey;
-            if (!sitekey) {
-                var el = document.querySelector('[data-sitekey]');
-                if (el) sitekey = el.getAttribute('data-sitekey');
-            }
-            if (!sitekey && window.turnstile && window.turnstile._widgets) {
-                var ws = Object.values(window.turnstile._widgets);
-                if (ws.length > 0 && ws[0].sitekey) sitekey = ws[0].sitekey;
-            }
-            return { sitekey: sitekey };
-        } catch(e) { return { error: String(e) }; }
-    """)
-    sitekey = (sitekey_info or {}).get("sitekey")
-    if not sitekey:
-        sitekey = HARDCODED_SITEKEY
-        print(f"[Turnstile] 未从页面提取到 Sitekey，使用硬编码保底: {sitekey}")
-    else:
-        print(f"[Turnstile] 提取到页面 Sitekey: {sitekey[:25]}...")
+    print(f"[Turnstile] 初始化补丁状态: {init_status}")
 
     max_retries = 30
     for i in range(max_retries):
         try:
-            # ── 1. 检查 Token ──
+            # ── 2. 检查 Token ──
             token_value = page.run_js("""
                 try {
                     if (window.turnstile) {
@@ -729,7 +711,7 @@ def getTurnstileToken():
                 print(f"[Turnstile] ✓ 验证通过! Token: {token_value[:40]}...")
                 return token_value
 
-            # ── 2. 检查并强制渲染 Widget ──
+            # ── 3. 检查并强制渲染 Widget ──
             status = page.run_js("""
                 try {
                     if (!window.turnstile) return { error: 'API not loaded' };
@@ -737,49 +719,63 @@ def getTurnstileToken():
                     var widgetCount = window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 0;
                     
                     if (widgetCount === 0) {
-                        // 强制创建一个独立容器进行渲染
                         var id = 'turnstile-force-container';
                         var container = document.getElementById(id);
                         if (!container) {
                             container = document.createElement('div');
                             container.id = id;
-                            container.style.display = 'none';
+                            container.style.display = 'block'; // 强制可见，防止某些检测
+                            container.style.width = '300px';
+                            container.style.height = '65px';
+                            container.style.position = 'absolute';
+                            container.style.top = '-1000px'; // 移出视区但保持可见状态
                             document.body.appendChild(container);
                         }
                         try {
-                            turnstile.render(container, {
+                            // 尝试以 normal 模式渲染，有时候 invisible 在无头环境下会被封杀
+                            var widgetId = turnstile.render(container, {
                                 sitekey: sitekey,
+                                theme: 'light',
+                                size: 'normal', 
                                 callback: function(token) {
                                     var inp = document.querySelector('[name="cf-turnstile-response"]');
                                     if (inp) inp.value = token;
                                 }
                             });
-                            return { action: 'render', status: 'sent' };
-                        } catch(re) { return { action: 'render', error: String(re) }; }
+                            return { action: 'render', status: 'success', id: String(widgetId) };
+                        } catch(re) { 
+                            return { action: 'render', status: 'error', msg: String(re), stack: re.stack }; 
+                        }
                     } else {
-                        // 已有 widget，尝试 execute
                         try { turnstile.execute(); return { action: 'execute', status: 'sent' }; }
                         catch(ee) { return { action: 'execute', error: String(ee) }; }
                     }
                 } catch(e) { return { error: String(e) }; }
-            """, sitekey)
+            """, HARDCODED_SITEKEY)
 
-            if i % 5 == 0:
-                print(f"[Turnstile] 轮询中 ({i+1}/{max_retries})... 当前状态: {status}")
+            if i % 3 == 0:
+                print(f"[Turnstile] 轮询 ({i+1}/{max_retries}): {status}")
+
+            # 如果已经 render 成功但没拿到 token，手动补一个 execute
+            if isinstance(status, dict) and status.get("status") == "success":
+                page.run_js("try { turnstile.execute(); } catch(e){}")
 
         except Exception as e:
-            print(f"[Turnstile] 异常: {e}")
+            print(f"[Turnstile] 循环异常: {e}")
 
         time.sleep(1.5)
 
     # ── 超时诊断 ──
     diagnostic = page.run_js("""
         try {
+            var iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+                src: (f.src||'').substring(0,60), w: f.width, h: f.height
+            }));
             return {
                 url: location.href,
                 hasAPI: !!window.turnstile,
                 widgetCount: window.turnstile && window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 0,
-                iframes: Array.from(document.querySelectorAll('iframe')).length
+                iframes: iframes
             };
         } catch(e) { return { error: String(e) }; }
     """)
