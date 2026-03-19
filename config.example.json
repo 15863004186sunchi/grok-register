@@ -4,6 +4,7 @@
     },
     "duckmail_api_base": "https://api.duckmail.sbs",
     "duckmail_bearer": "<your_duckmail_bearer_token>",
+    "yescaptcha_key": "<your_yescaptcha_api_key>",
     "proxy": "",
     "browser_proxy": "",
     "api": {
