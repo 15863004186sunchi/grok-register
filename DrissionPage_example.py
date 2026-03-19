@@ -110,8 +110,18 @@ import platform
 import shutil
 import glob as _glob_mod
 if platform.system() == "Linux":
-    # 优先用 playwright 装的 chromium（无 AppArmor 限制）
-    _pw_chromes = _glob_mod.glob(os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome"))
+    # 优先用 Playwright 的 chromium（容器镜像里通常在 /ms-playwright 或 env PLAYWRIGHT_BROWSERS_PATH）
+    _pw_roots = []
+    _env_pw_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if _env_pw_root:
+        _pw_roots.append(_env_pw_root)
+    _pw_roots.append(os.path.expanduser("~/.cache/ms-playwright"))
+    _pw_roots.append("/ms-playwright")
+
+    _pw_chromes = []
+    for _root in _pw_roots:
+        _pw_chromes.extend(_glob_mod.glob(os.path.join(_root, "chromium-*/chrome-linux*/chrome")))
+
     if _pw_chromes:
         co.set_browser_path(_pw_chromes[0])
     else:
