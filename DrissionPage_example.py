@@ -1012,17 +1012,26 @@ return matches.slice(0, 30);
     raise Exception("登录后未提取到可见数字文本")
 
 
-def wait_for_sso_cookie(timeout=30):
+def wait_for_sso_cookie(timeout=60):
     # 必须在注册完成后再取 sso，优先抓取精确的 sso cookie。
+    # 增强版：增加截图和 HTML 导出，便于排查 sso 为空的原因。
     deadline = time.time() + timeout
     last_seen_names = set()
+    start_url = page.url
 
+    print(f"[*] 正在等待 sso cookie (超时: {timeout}s)...")
     while time.time() < deadline:
         try:
             refresh_active_page()
             if page is None:
                 time.sleep(1)
                 continue
+
+            # 诊断：当前的 URL 和标题
+            curr_url = page.url
+            curr_title = page.title
+            if curr_url != start_url:
+                print(f"[Debug] URL 已变化: {curr_url} | 标题: {curr_title}")
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
             for item in cookies:
@@ -1039,13 +1048,36 @@ def wait_for_sso_cookie(timeout=30):
                 if name == "sso" and value:
                     print("[*] 注册完成后已获取到 sso cookie。")
                     return value
+            
+            # 如果 URL 变成了 login 或者 error，可能已经失败
+            if "login" in curr_url.lower() or "error" in curr_url.lower():
+                print(f"[Warn] 检测到 URL 异常（可能跳转到了登录或错误页）: {curr_url}")
 
         except PageDisconnectedError:
             refresh_active_page()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Debug] 轮询 Cookie 异常: {e}")
 
-        time.sleep(1)
+        time.sleep(2)
+
+    # ── 超时诊断：保存现场 ──
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%H%M%S")
+        
+        # 1. 截图
+        shot_path = os.path.join(log_dir, f"sso_timeout_{ts}.png")
+        page.get_screenshot(path=shot_path, full_page=True)
+        print(f"[Turnstile] 超时已保存截图: {shot_path}")
+        
+        # 2. HTML 源码
+        html_path = os.path.join(log_dir, f"sso_timeout_{ts}.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page.html)
+        print(f"[Turnstile] 超时已保存 HTML: {html_path}")
+    except Exception as diag_err:
+        print(f"[Error] 保存故障快照失败: {diag_err}")
 
     raise Exception(f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}")
 
