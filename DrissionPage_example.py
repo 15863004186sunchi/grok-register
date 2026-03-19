@@ -671,33 +671,68 @@ def getTurnstileToken():
     # 1. 先等待一段时间，让 Turnstile 自动完成（auto-pass 场景）
     # 2. 若未自动完成，提取 sitekey 并调用 turnstile.execute() 主动触发
     # 3. 只轮询 cf-turnstile-response 的值，不要点击（点击会干扰 invisible 模式）
-    try:
-        page.run_js("try { if(window.turnstile) turnstile.reset(); } catch(e) { }")
-    except Exception:
-        pass
+
+    # ── 初始化：Reset + 诊断日志 ──
+    reset_result = page.run_js("""
+        try {
+            var had_api = !!window.turnstile;
+            if (window.turnstile) turnstile.reset();
+            var widgets = window.turnstile && window.turnstile._widgets
+                ? Object.keys(window.turnstile._widgets).length : 0;
+            var containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]').length;
+            var input = document.querySelector('[name="cf-turnstile-response"]');
+            var iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+                src: (f.src || '').substring(0, 80),
+                w: f.width, h: f.height
+            }));
+            return { hadAPI: had_api, widgetCount: widgets, containerCount: containers,
+                     hasInput: !!input, inputValue: input ? (input.value||'').substring(0,20) : '',
+                     iframes: iframes };
+        } catch(e) { return { error: String(e) }; }
+    """)
+    print(f"[Turnstile] 初始状态: {reset_result}")
 
     # 先给页面 3 秒，让 invisible Turnstile 有机会自动通过
+    print("[Turnstile] 等待 3s，让 invisible Turnstile 自动运行...")
     time.sleep(3)
 
-    # 提取 sitekey，为 execute() 准备
-    sitekey = page.run_js("""
+    # ── 提取 sitekey ──
+    sitekey_info = page.run_js("""
         try {
-            // Grok 通常把 sitekey 放在 turnstile 配置里
+            var sitekey = null;
+            var method = null;
+            // 方法1: _cf_turnstile_options
             var configs = window._cf_turnstile_options || [];
-            if (configs.length > 0) return configs[0].sitekey || null;
-            // 备选：从已有 widget container 中读
-            var el = document.querySelector('[data-sitekey]');
-            if (el) return el.getAttribute('data-sitekey');
-            // 备选：从 Turnstile API 对象中读
-            if (window.turnstile && window.turnstile._widgets) {
-                var widgets = Object.values(window.turnstile._widgets);
-                if (widgets.length > 0) return widgets[0].sitekey || null;
+            if (configs.length > 0 && configs[0].sitekey) {
+                sitekey = configs[0].sitekey; method = '_cf_turnstile_options';
             }
-            return null;
-        } catch(e) { return null; }
+            // 方法2: data-sitekey 属性
+            if (!sitekey) {
+                var el = document.querySelector('[data-sitekey]');
+                if (el) { sitekey = el.getAttribute('data-sitekey'); method = 'data-sitekey attr'; }
+            }
+            // 方法3: turnstile._widgets 内部对象
+            if (!sitekey && window.turnstile && window.turnstile._widgets) {
+                var widgets = Object.values(window.turnstile._widgets);
+                if (widgets.length > 0) { sitekey = widgets[0].sitekey || null; method = '_widgets object'; }
+            }
+            // 方法4: 从脚本内容搜索 sitekey（兜底）
+            if (!sitekey) {
+                var scripts = Array.from(document.querySelectorAll('script:not([src])'));
+                for (var s of scripts) {
+                    var m = (s.textContent || '').match(/"sitekey"\s*:\s*"(0x[A-Za-z0-9]+)"/);
+                    if (m) { sitekey = m[1]; method = 'inline script'; break; }
+                }
+            }
+            return { sitekey: sitekey, method: method };
+        } catch(e) { return { error: String(e) }; }
     """)
+    sitekey = (sitekey_info or {}).get("sitekey")
+    sitekey_method = (sitekey_info or {}).get("method", "未找到")
     if sitekey:
-        print(f"[*] 提取到 Turnstile sitekey: {sitekey[:20]}...")
+        print(f"[Turnstile] sitekey 提取成功 (via {sitekey_method}): {sitekey[:25]}...")
+    else:
+        print(f"[Turnstile] 警告：未提取到 sitekey，将依赖 API 自身状态触发。info={sitekey_info}")
 
     max_retries = 25
     for i in range(max_retries):
@@ -715,56 +750,69 @@ def getTurnstileToken():
                 } catch(e) { return null; }
             """)
             if token_value:
-                print(f"[*] Turnstile 已通过，获取到 Token: {token_value[:30]}...")
+                print(f"[Turnstile] ✓ Token 获取成功 (第 {i + 1} 次轮询): {token_value[:30]}...")
                 return token_value
 
-            # ── 调用 execute() 主动触发 invisible Turnstile ──
-            if i % 5 == 0:
-                print(f"[*] 等待 Turnstile 响应... (第 {i + 1}/{max_retries} 次)")
-            page.run_js("""
+            # ── 调用 execute() 主动触发 + 获取执行状态 ──
+            exec_result = page.run_js("""
                 try {
-                    if (!window.turnstile) return;
-                    // 先尝试用 sitekey 重新 execute
+                    if (!window.turnstile) return { error: 'no turnstile API' };
                     var sitekey = arguments[0];
                     var el = document.querySelector('[name="cf-turnstile-response"]');
                     var container = el ? el.parentElement : null;
+                    var method = null;
 
                     if (sitekey && container) {
                         turnstile.execute(container, { sitekey: sitekey });
+                        method = 'execute(container, sitekey)';
                     } else {
-                        // fallback：对所有已知 widget 调用 execute
                         var containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
                         if (containers.length > 0) {
                             turnstile.execute(containers[0]);
+                            method = 'execute(cf-turnstile[0])';
                         } else if (container) {
                             turnstile.execute(container);
+                            method = 'execute(parent of input)';
+                        } else {
+                            method = 'no suitable container found';
                         }
                     }
-                } catch(e) { }
+
+                    var widgets = window.turnstile._widgets
+                        ? Object.keys(window.turnstile._widgets).length : '?';
+                    return { ok: true, method: method, widgetCount: widgets };
+                } catch(e) { return { error: String(e) }; }
             """, sitekey)
 
-        except Exception as e:
             if i % 5 == 0:
-                print(f"[Debug] Turnstile 尝试中遇到异常: {e}")
+                print(f"[Turnstile] 第 {i + 1}/{max_retries} 次 execute 状态: {exec_result}")
+
+        except Exception as e:
+            print(f"[Turnstile] 第 {i + 1} 次异常: {e}")
 
         time.sleep(2)
 
-    # 超时后输出 DOM 快照帮助排查
+    # ── 超时后输出完整 DOM 快照 ──
     try:
         debug_info = page.run_js("""
             var el = document.querySelector('[name="cf-turnstile-response"]');
             var containers = document.querySelectorAll('[data-sitekey], .cf-turnstile');
+            var scripts = Array.from(document.querySelectorAll('script[src*="turnstile"]')).map(s => s.src.substring(0,80));
             return {
                 url: location.href,
                 hasTurnstileInput: !!el,
                 turnstileInputValue: el ? (el.value || '').substring(0, 50) : '',
                 containerCount: containers.length,
                 hasTurnstileAPI: !!window.turnstile,
-                widgetCount: window.turnstile && window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 0,
-                iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({src: (f.src||'').substring(0,80), width: f.width, height: f.height})).slice(0, 5)
+                widgetCount: window.turnstile && window.turnstile._widgets
+                    ? Object.keys(window.turnstile._widgets).length : 0,
+                turnstileScripts: scripts,
+                iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({
+                    src: (f.src||'').substring(0,80), width: f.width, height: f.height
+                })).slice(0, 5)
             };
         """)
-        print(f"[Debug] Turnstile 超时，DOM 快照: {debug_info}")
+        print(f"[Turnstile] 超时 DOM 快照: {debug_info}")
     except Exception:
         pass
 
