@@ -666,42 +666,94 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # 复用现有 turnstile 处理逻辑，在最终注册页需要时再触发。
-    page.run_js("try { turnstile.reset() } catch(e) { }")
+    # 复用现有 turnstile 处理逻辑，在最终注册页时由 profile 提交前触发。
+    # 增加更多日志输出，以便排查在容器环境下的点击失效问题。
+    try:
+        page.run_js("try { if(window.turnstile) turnstile.reset(); } catch(e) { }")
+    except:
+        pass
 
-    turnstileResponse = None
-
-    for i in range(0, 15):
+    import time
+    max_retries = 30  # 增加重试次数，部分 Turnstile 加载较慢
+    for i in range(max_retries):
         try:
-            turnstileResponse = page.run_js("try { return turnstile.getResponse() } catch(e) { return null }")
+            # 1. 尝试直接获取已生成的 Response (如果有)
+            turnstileResponse = page.run_js("try { return (window.turnstile && turnstile.getResponse()) || null; } catch(e) { return null; }")
             if turnstileResponse:
+                print(f"[*] Turnstile 已自动通过，获取到 Token: {turnstileResponse[:20]}...")
                 return turnstileResponse
 
-            challengeSolution = page.ele("@name=cf-turnstile-response")
+            # 2. 查找 Turnstile 容器
+            challengeSolution = page.ele("@name=cf-turnstile-response", timeout=1)
+            if not challengeSolution:
+                # 尝试通过 querySelector 找可能的 container
+                if i % 10 == 0:
+                    print(f"[*] 等待 Turnstile 组件加载... (第 {i} 秒)")
+                time.sleep(1)
+                continue
+
             challengeWrapper = challengeSolution.parent()
-            challengeIframe = challengeWrapper.shadow_root.ele("tag:iframe")
+            if not challengeWrapper:
+                time.sleep(1)
+                continue
 
+            # 3. 进入 Shadow Root 查找 iframe
+            sr = challengeWrapper.shadow_root
+            if not sr:
+                # print("[Debug] 未找到 challengeWrapper 的 shadow_root")
+                time.sleep(1)
+                continue
+
+            challengeIframe = sr.ele("tag:iframe", timeout=1)
+            if not challengeIframe:
+                # print("[Debug] Shadow root 内未找到 iframe")
+                time.sleep(1)
+                continue
+
+            # 4. 在 iframe 内模拟真人属性并点击
+            # 注入 MouseEvent 模拟，绕过部分 headless 检测
             challengeIframe.run_js("""
-window.dtp = 1
-function getRandomInt(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
+                window.dtp = 1;
+                if (!window.MouseEvent.prototype.hasOwnProperty('_mocked')) {
+                    const getRandomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+                    let sX = getRandomInt(800, 1200);
+                    let sY = getRandomInt(400, 600);
+                    Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sX });
+                    Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sY });
+                    MouseEvent.prototype._mocked = true;
+                }
+            """)
 
-// 旧方案在 4K 屏下不稳定，这里给出更自然的屏幕坐标。
-let screenX = getRandomInt(800, 1200);
-let screenY = getRandomInt(400, 600);
+            # 5. 查找 iframe 内的 checkbox 并点击
+            # Cloudflare 的 iframe 内部结构可能有自己的 shadow root 或简单 body
+            iframe_body = challengeIframe.ele("tag:body", timeout=1)
+            if not iframe_body:
+                time.sleep(1)
+                continue
 
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-                        """)
+            # 这里的选择器需要兼容性：有时是 input, 有时是 span#success-icon 附近的 div
+            # 我们直接找可见的 input 或者具有特定类名的元素
+            checkbox = iframe_body.ele("tag:input", timeout=1) or \
+                       iframe_body.ele("#challenge-stage", timeout=1)
+            
+            if checkbox:
+                if i % 5 == 0:
+                    print("[*] 检测到 Turnstile 验证框，尝试点击...")
+                checkbox.click()
+            else:
+                # 如果没找到明确的 checkbox，尝试点击整个 body 中心
+                if i % 5 == 0:
+                    print("[*] 未找到明确 Checkbox，尝试点击 Iframe 中心...")
+                iframe_body.click()
 
-            challengeIframeBody = challengeIframe.ele("tag:body").shadow_root
-            challengeButton = challengeIframeBody.ele("tag:input")
-            challengeButton.click()
-        except:
+        except Exception as e:
+            if i % 10 == 0:
+                print(f"[Debug] Turnstile 尝试中遇到异常: {e}")
             pass
+        
         time.sleep(1)
-    raise Exception("failed to solve turnstile")
+
+    raise Exception("failed to solve turnstile after 30 seconds")
 
 
 def build_profile():
