@@ -666,124 +666,130 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # Grok 注册页面的 Turnstile 真人化模拟处理方案：
-    # 1. 使用硬编码 Sitekey: 0x4AAAAAAAhr9JGVDZbrZOo0
-    # 2. 强力触发初始化函数（如 zntnbba1e5q）
-    # 3. 创建一个位于页面中心且「绝对可见」的容器，绕过 Cloudflare 对 Invisible/Offscreen 的检测
-    # 4. 模拟鼠标平滑滑过验证框
+    # 策略：进入页面上真实存在的 Turnstile iframe，直接点击「确认您是真人」复选框
+    # 截图确认：页面已经渲染了 iframe#cf-chl-widget-*，里面有 Checkbox，只需点击
 
-    HARDCODED_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
-    print("[Turnstile] 正在启动真人化验证模拟...")
+    print("[Turnstile] 等待真实 Turnstile iframe 加载...")
 
-    # ── 1. 尝试初始化 API ──
-    onload_patch = page.run_js("""
-        try {
-            var scripts = Array.from(document.querySelectorAll('script[src*="turnstile"]'));
-            var onload = null;
-            for (var s of scripts) {
-                var m = s.src.match(/[?&]onload=([A-Za-z0-9_]+)/);
-                if (m) { onload = m[1]; break; }
-            }
-            if (onload && window[onload]) {
-                window[onload]();
-                return { action: 'onload', func: onload, status: 'invoked' };
-            }
-            return { action: 'onload', status: 'not_found_or_already_loaded' };
-        } catch(e) { return { error: String(e) }; }
-    """)
-    print(f"[Turnstile] API 初始化: {onload_patch}")
+    # ── 1. 等待真实 iframe 出现（最多等 15s）──
+    iframe_el = None
+    for wait_i in range(15):
+        iframe_src = page.run_js("""
+            var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            return f ? { id: f.id, src: f.src.substring(0, 80), w: f.width, h: f.height } : null;
+        """)
+        if iframe_src:
+            print(f"[Turnstile] 发现真实 iframe: {iframe_src}")
+            break
+        print(f"[Turnstile] 等待 iframe 出现... ({wait_i+1}/15)")
+        time.sleep(1)
+    else:
+        print("[Turnstile] 未找到真实 iframe，将尝试直接轮询 token")
 
-    # 创建一个明显的容器
-    page.run_js("""
-        var id = 'turnstile-human-container';
-        if (!document.getElementById(id)) {
-            var c = document.createElement('div');
-            c.id = id;
-            c.style.position = 'fixed';
-            c.style.top = '50%';
-            c.style.left = '50%';
-            c.style.transform = 'translate(-50%, -50%)';
-            c.style.zIndex = '999999';
-            c.style.width = '300px';
-            c.style.height = '65px';
-            c.style.background = 'white';
-            c.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
-            document.body.appendChild(c);
-        }
-    """)
-
-    rendered_id = None
-    max_retries = 40
-    for i in range(max_retries):
+    # ── 2. 进入 iframe 点击 checkbox ──
+    clicked = False
+    for click_attempt in range(5):
         try:
-            # ── 2. 轮询 Token ──
+            # 获取 iframe 元素
+            iframe = page.get_frame('iframe[src*="challenges.cloudflare.com"]')
+            if not iframe:
+                iframe = page.get_frame('@src:challenges.cloudflare.com')
+            if not iframe:
+                # 按 id 前缀获取
+                iframe_id = page.run_js("""
+                    var f = document.querySelector('iframe[id^="cf-chl-widget"]');
+                    return f ? f.id : null;
+                """)
+                if iframe_id:
+                    iframe = page.get_frame(f'#{iframe_id}')
+
+            if iframe:
+                print(f"[Turnstile] 成功进入 iframe，尝试点击 Checkbox (第 {click_attempt+1} 次)...")
+                # 方式A: 找 span[id="cf-turnstile-label"] 或 input[type=checkbox]
+                checkbox = iframe.ele('css:input[type="checkbox"]', timeout=3)
+                if not checkbox:
+                    checkbox = iframe.ele('css:span#cf-turnstile-label', timeout=2)
+                if not checkbox:
+                    # 找整个正文 body 点击
+                    checkbox = iframe.ele('css:body', timeout=2)
+
+                if checkbox:
+                    checkbox.click(by_js=False)
+                    print(f"[Turnstile] ✓ 已点击 Checkbox 元素: {checkbox.tag}")
+                    clicked = True
+                    break
+                else:
+                    print("[Turnstile] iframe 内未找到 Checkbox 元素，点击 iframe 中心...")
+                    iframe_el = page.ele('css:iframe[src*="challenges.cloudflare.com"]')
+                    if iframe_el:
+                        iframe_el.click()
+                        clicked = True
+                        break
+            else:
+                print(f"[Turnstile] 无法获取 iframe frame 对象 (第 {click_attempt+1} 次)")
+        except Exception as e:
+            print(f"[Turnstile] 进入 iframe 异常 (第 {click_attempt+1} 次): {e}")
+        time.sleep(1.5)
+
+    if not clicked:
+        # 最后兜底：直接点击 iframe 元素本身
+        try:
+            iframe_el = page.ele('css:iframe[id^="cf-chl-widget"]')
+            if iframe_el:
+                iframe_el.click()
+                print("[Turnstile] 兜底：直接点击 iframe 元素")
+        except Exception as e:
+            print(f"[Turnstile] 兜底点击失败: {e}")
+
+    # ── 3. 轮询 Token（最多 30s）──
+    print("[Turnstile] 开始轮询验证 Token...")
+    for poll_i in range(20):
+        try:
             token = page.run_js("""
                 try {
                     if (window.turnstile) {
                         var r = turnstile.getResponse();
-                        if (r) return r;
+                        if (r && r.length > 10) return r;
                     }
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return (el && el.value && el.value.length > 10) ? el.value : null;
+                    var inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
+                    for (var inp of inputs) {
+                        if (inp.value && inp.value.length > 10) return inp.value;
+                    }
+                    return null;
                 } catch(e) { return null; }
             """)
             if token:
-                print(f"[Turnstile] ✓ 验证成功! 第 {i+1} 次获取到 Token: {token[:40]}...")
+                print(f"[Turnstile] ✓ 验证成功! 第 {poll_i+1} 次获取到 Token: {token[:40]}...")
                 return token
-
-            # ── 3. 维护 Widget 状态 ──
-            if not rendered_id:
-                # 仅 Render 一次
-                render_res = page.run_js("""
-                    try {
-                        if (!window.turnstile) return { status: 'waiting_api' };
-                        var container = document.getElementById('turnstile-human-container');
-                        var wId = turnstile.render(container, {
-                            sitekey: arguments[0],
-                            theme: 'light',
-                            callback: function(token) {
-                                var inp = document.querySelector('[name="cf-turnstile-response"]');
-                                if (inp) inp.value = token;
-                            }
-                        });
-                        return { status: 'success', id: String(wId) };
-                    } catch(e) { return { status: 'error', msg: String(e) }; }
-                """, HARDCODED_SITEKEY)
-                
-                if isinstance(render_res, dict) and render_res.get('status') == 'success':
-                    rendered_id = render_res['id']
-                    print(f"[Turnstile] 容器渲染成功 ID: {rendered_id}")
-                    # 人为模拟：鼠标滑过
-                    try:
-                        box = page.ele('#turnstile-human-container')
-                        if box: 
-                            print("[Turnstile] 模拟仿真鼠标移动...")
-                            # page.actions.move_to(box).wait(0.2).move_by(5, 5).wait(0.1).move_by(-5, -5)
-                            box.hover()
-                    except: pass
-                else:
-                    if i % 5 == 0: print(f"[Turnstile] 等待渲染: {render_res}")
-            else:
-                # 既然已经 Render 过了但没 Token，尝试 Execute 激活
-                page.run_js("try { turnstile.execute(); } catch(e){}")
-
-            if i % 5 == 0:
-                # 诊断：widgetCount 状态
-                diag = page.run_js("return window.turnstile ? (window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 'no_widgets_obj') : 'no_api'")
-                print(f"[Turnstile] 轮询 ({i+1}/{max_retries}): widgetCount={diag}")
-
         except Exception as e:
-            print(f"[Turnstile] 循环异常: {e}")
+            print(f"[Turnstile] 轮询异常: {e}")
+
+        if poll_i % 5 == 0:
+            # 每 5 次再点一次（Checkbox 可能需要多次点击才响应）
+            try:
+                iframe = page.get_frame('iframe[src*="challenges.cloudflare.com"]')
+                if iframe:
+                    cb = iframe.ele('css:input[type="checkbox"]', timeout=1)
+                    if cb: cb.click(by_js=False)
+            except: pass
 
         time.sleep(1.5)
 
     # 最终诊断
     final_diag = page.run_js("""
-        var items = Array.from(document.querySelectorAll('iframe')).map(f => ({src: (f.src||'').substring(0,50), w:f.width, h:f.height}));
-        return { widgets: window.turnstile ? Object.keys(window.turnstile._widgets||{}).length : 'N/A', iframes: items };
+        var iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+            id: f.id, src: (f.src||'').substring(0,60), w: f.width, h: f.height
+        }));
+        var inputs = Array.from(document.querySelectorAll('[name*="turnstile"]')).map(i => ({
+            name: i.name, value: (i.value||'').substring(0,30)
+        }));
+        return { iframes: iframes, inputs: inputs };
     """)
-    print(f"[Turnstile] 超时最终诊断: {final_diag}")
-    raise Exception("Turnstile 验证超时，未能获得真人验证 Token")
+    print(f"[Turnstile] 超时诊断: {final_diag}")
+    raise Exception("Turnstile 验证超时，未能获得 Token")
+
+
+
 
 
 def build_profile():
