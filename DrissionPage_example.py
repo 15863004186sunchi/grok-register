@@ -666,120 +666,54 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # Grok 注册页面使用的是 Invisible Turnstile（无 checkbox，1x1 不可见 iframe），
-    # 正确处理方式：
-    # 1. 先等待一段时间，让 Turnstile 自动完成（auto-pass 场景）
-    # 2. 若未自动完成，提取 sitekey 并调用 turnstile.render() 创建 widget
-    # 3. 只轮询 cf-turnstile-response 的值，不要点击（点击会干扰 invisible 模式）
+    # Grok 注册页面的 Turnstile 处理策略：
+    # 1. 使用用户提供的硬编码 Sitekey 作为保底：0x4AAAAAAAhr9JGVDZbrZOo0
+    # 2. 如果页面未自动渲染 Widget (widgetCount: 0)，则强制调用 turnstile.render()
+    # 3. 轮询 token，不点击（针对 invisible 模式优化）
+
+    HARDCODED_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 
     # ── 初始化：Reset + 诊断日志 ──
+    print("[Turnstile] 正在初始化验证组件...")
     reset_result = page.run_js("""
         try {
-            var had_api = !!window.turnstile;
             if (window.turnstile) { try { turnstile.reset(); } catch(e){} }
             var widgets = window.turnstile && window.turnstile._widgets
                 ? Object.keys(window.turnstile._widgets).length : 0;
             var containers = document.querySelectorAll('.cf-turnstile, [data-sitekey]').length;
-            var input = document.querySelector('[name="cf-turnstile-response"]');
-            var iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
-                src: (f.src || '').substring(0, 80),
-                w: f.width, h: f.height
-            }));
-            return { hadAPI: had_api, widgetCount: widgets, containerCount: containers,
-                     hasInput: !!input, inputValue: input ? (input.value||'').substring(0,20) : '',
-                     iframes: iframes };
+            return { hadAPI: !!window.turnstile, widgetCount: widgets, containerCount: containers };
         } catch(e) { return { error: String(e) }; }
     """)
     print(f"[Turnstile] 初始状态: {reset_result}")
 
-    # 先给页面 3 秒，让 invisible Turnstile 有机会自动通过
-    print("[Turnstile] 等待 3s，让 invisible Turnstile 自动运行...")
-    time.sleep(3)
-
-    # ── 提取 sitekey + 如果 widgetCount==0 则尝试 render ──
-    sitekey_and_render = page.run_js("""
+    # ── 提取 sitekey ──
+    sitekey_info = page.run_js("""
         try {
             var sitekey = null;
-            var method = null;
-
-            // 方法1: _cf_turnstile_options
             var configs = window._cf_turnstile_options || [];
-            if (configs.length > 0 && configs[0].sitekey) {
-                sitekey = configs[0].sitekey; method = '_cf_turnstile_options';
-            }
-            // 方法2: data-sitekey 属性
+            if (configs.length > 0 && configs[0].sitekey) sitekey = configs[0].sitekey;
             if (!sitekey) {
                 var el = document.querySelector('[data-sitekey]');
-                if (el) { sitekey = el.getAttribute('data-sitekey'); method = 'data-sitekey attr'; }
+                if (el) sitekey = el.getAttribute('data-sitekey');
             }
-            // 方法3: turnstile._widgets 内部对象
             if (!sitekey && window.turnstile && window.turnstile._widgets) {
                 var ws = Object.values(window.turnstile._widgets);
-                if (ws.length > 0 && ws[0].sitekey) { sitekey = ws[0].sitekey; method = '_widgets object'; }
+                if (ws.length > 0 && ws[0].sitekey) sitekey = ws[0].sitekey;
             }
-            // 方法4: 从 inline script 搜索 sitekey
-            if (!sitekey) {
-                var scripts = Array.from(document.querySelectorAll('script:not([src])'));
-                for (var s of scripts) {
-                    var txt = s.textContent || '';
-                    var m = txt.match(/sitekey\s*[:\=]\s*["']?(0x[A-Za-z0-9]+)["']?/);
-                    if (m) { sitekey = m[1]; method = 'inline script'; break; }
-                }
-            }
-            // 方法5: 搜索全部 JS 文本（包括行内和全局变量）
-            if (!sitekey) {
-                var all = document.documentElement.innerHTML;
-                var m5 = all.match(/0x[A-Za-z0-9]{10,}/);
-                if (m5) { sitekey = m5[0]; method = 'html regex (0x...)'; }
-            }
-
-            // ── 如果找到 sitekey 且 widget 数为 0，尝试 render 出一个 ──
-            var renderResult = null;
-            if (window.turnstile) {
-                var widgetCount = window.turnstile._widgets
-                    ? Object.keys(window.turnstile._widgets).length : 0;
-                if (widgetCount === 0 && sitekey) {
-                    // 找到或创建一个容器来 render
-                    var container = document.querySelector('[name="cf-turnstile-response"]');
-                    var renderTarget = container ? container.parentElement : null;
-                    if (!renderTarget) {
-                        renderTarget = document.createElement('div');
-                        document.body.appendChild(renderTarget);
-                    }
-                    try {
-                        var widgetId = turnstile.render(renderTarget, {
-                            sitekey: sitekey,
-                            size: 'invisible',
-                            callback: function(token) {
-                                // callback 会把 token 写入 cf-turnstile-response
-                                var inp = document.querySelector('[name="cf-turnstile-response"]');
-                                if (inp) inp.value = token;
-                            }
-                        });
-                        renderResult = { ok: true, widgetId: String(widgetId) };
-                    } catch(re) {
-                        renderResult = { error: String(re) };
-                    }
-                }
-            }
-
-            return { sitekey: sitekey, method: method, renderResult: renderResult };
+            return { sitekey: sitekey };
         } catch(e) { return { error: String(e) }; }
     """)
-    sitekey = (sitekey_and_render or {}).get("sitekey") or ""
-    sitekey_method = (sitekey_and_render or {}).get("method", "未找到")
-    render_result = (sitekey_and_render or {}).get("renderResult")
-    if sitekey:
-        print(f"[Turnstile] sitekey 提取成功 (via {sitekey_method}): {sitekey[:25]}...")
+    sitekey = (sitekey_info or {}).get("sitekey")
+    if not sitekey:
+        sitekey = HARDCODED_SITEKEY
+        print(f"[Turnstile] 未从页面提取到 Sitekey，使用硬编码保底: {sitekey}")
     else:
-        print(f"[Turnstile] 警告：未提取到 sitekey。info={sitekey_and_render}")
-    if render_result:
-        print(f"[Turnstile] render() 结果: {render_result}")
+        print(f"[Turnstile] 提取到页面 Sitekey: {sitekey[:25]}...")
 
-    max_retries = 25
+    max_retries = 30
     for i in range(max_retries):
         try:
-            # ── 每次循环先检查是否已经有 token ──
+            # ── 1. 检查 Token ──
             token_value = page.run_js("""
                 try {
                     if (window.turnstile) {
@@ -792,87 +726,65 @@ def getTurnstileToken():
                 } catch(e) { return null; }
             """)
             if token_value:
-                print(f"[Turnstile] ✓ Token 获取成功 (第 {i + 1} 次轮询): {token_value[:30]}...")
+                print(f"[Turnstile] ✓ 验证通过! Token: {token_value[:40]}...")
                 return token_value
 
-            # ── 调用 execute / render 主动触发 + 获取执行状态 ──
-            # 注意：sitekey 可能是空字符串，JS 内部会判断
-            exec_result = page.run_js("""
+            # ── 2. 检查并强制渲染 Widget ──
+            status = page.run_js("""
                 try {
-                    if (!window.turnstile) return { error: 'no turnstile API' };
-                    var sitekey = arguments[0] || '';
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    var container = el ? el.parentElement : null;
-                    var method = null;
-
-                    var widgetCount = window.turnstile._widgets
-                        ? Object.keys(window.turnstile._widgets).length : 0;
-
-                    // 如果还是没有 widget，再试一次 render
-                    if (widgetCount === 0 && sitekey && container) {
+                    if (!window.turnstile) return { error: 'API not loaded' };
+                    var sitekey = arguments[0];
+                    var widgetCount = window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 0;
+                    
+                    if (widgetCount === 0) {
+                        // 强制创建一个独立容器进行渲染
+                        var id = 'turnstile-force-container';
+                        var container = document.getElementById(id);
+                        if (!container) {
+                            container = document.createElement('div');
+                            container.id = id;
+                            container.style.display = 'none';
+                            document.body.appendChild(container);
+                        }
                         try {
                             turnstile.render(container, {
                                 sitekey: sitekey,
-                                size: 'invisible',
                                 callback: function(token) {
                                     var inp = document.querySelector('[name="cf-turnstile-response"]');
                                     if (inp) inp.value = token;
                                 }
                             });
-                            method = 'render(invisible)';
-                        } catch(re) {
-                            method = 'render failed: ' + String(re);
-                        }
-                    } else if (widgetCount > 0) {
-                        // 有 widget，尝试 execute
-                        try { turnstile.execute(); method = 'execute()'; }
-                        catch(ee) { method = 'execute failed: ' + String(ee); }
-                    } else if (container) {
-                        try { turnstile.execute(container); method = 'execute(container)'; }
-                        catch(ee) { method = 'execute(container) failed: ' + String(ee); }
+                            return { action: 'render', status: 'sent' };
+                        } catch(re) { return { action: 'render', error: String(re) }; }
                     } else {
-                        method = 'no widget, no sitekey, no container';
+                        // 已有 widget，尝试 execute
+                        try { turnstile.execute(); return { action: 'execute', status: 'sent' }; }
+                        catch(ee) { return { action: 'execute', error: String(ee) }; }
                     }
-
-                    widgetCount = window.turnstile._widgets
-                        ? Object.keys(window.turnstile._widgets).length : 0;
-                    return { ok: true, method: method, widgetCount: widgetCount };
                 } catch(e) { return { error: String(e) }; }
-            """, sitekey or "")
+            """, sitekey)
 
             if i % 5 == 0:
-                print(f"[Turnstile] 第 {i + 1}/{max_retries} 次状态: {exec_result}")
+                print(f"[Turnstile] 轮询中 ({i+1}/{max_retries})... 当前状态: {status}")
 
         except Exception as e:
-            print(f"[Turnstile] 第 {i + 1} 次异常: {e}")
+            print(f"[Turnstile] 异常: {e}")
 
-        time.sleep(2)
+        time.sleep(1.5)
 
-    # ── 超时后输出完整 DOM 快照 ──
-    try:
-        debug_info = page.run_js("""
-            var el = document.querySelector('[name="cf-turnstile-response"]');
-            var containers = document.querySelectorAll('[data-sitekey], .cf-turnstile');
-            var scripts = Array.from(document.querySelectorAll('script[src*="turnstile"]')).map(s => s.src.substring(0,80));
+    # ── 超时诊断 ──
+    diagnostic = page.run_js("""
+        try {
             return {
                 url: location.href,
-                hasTurnstileInput: !!el,
-                turnstileInputValue: el ? (el.value || '').substring(0, 50) : '',
-                containerCount: containers.length,
-                hasTurnstileAPI: !!window.turnstile,
-                widgetCount: window.turnstile && window.turnstile._widgets
-                    ? Object.keys(window.turnstile._widgets).length : 0,
-                turnstileScripts: scripts,
-                iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({
-                    src: (f.src||'').substring(0,80), width: f.width, height: f.height
-                })).slice(0, 5)
+                hasAPI: !!window.turnstile,
+                widgetCount: window.turnstile && window.turnstile._widgets ? Object.keys(window.turnstile._widgets).length : 0,
+                iframes: Array.from(document.querySelectorAll('iframe')).length
             };
-        """)
-        print(f"[Turnstile] 超时 DOM 快照: {debug_info}")
-    except Exception:
-        pass
-
-    raise Exception("Turnstile 验证超时，未获取到 Token")
+        } catch(e) { return { error: String(e) }; }
+    """)
+    print(f"[Turnstile] 超时快照: {diagnostic}")
+    raise Exception("Turnstile 验证超时")
 
 
 def build_profile():
