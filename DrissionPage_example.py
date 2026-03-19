@@ -666,94 +666,127 @@ return { url: location.href, inputs, buttons };
 
 
 def getTurnstileToken():
-    # 复用现有 turnstile 处理逻辑，在最终注册页时由 profile 提交前触发。
-    # 增加更多日志输出，以便排查在容器环境下的点击失效问题。
+    # 借鉴 Turnstile-Solver 的外层点击策略：
+    # 1. 优先轮询 cf-turnstile-response 的值（有时扩展 + 页面自身就能自动通过）
+    # 2. 不再钻 Shadow Root / Iframe 内部找 Checkbox，而是直接点击外层容器
+    # 3. 同时尝试 JS API 调用 turnstile.execute() 作为辅助触发
     try:
         page.run_js("try { if(window.turnstile) turnstile.reset(); } catch(e) { }")
-    except:
+    except Exception:
         pass
 
-    import time
-    max_retries = 30  # 增加重试次数，部分 Turnstile 加载较慢
+    max_retries = 20
     for i in range(max_retries):
         try:
-            # 1. 尝试直接获取已生成的 Response (如果有)
-            turnstileResponse = page.run_js("try { return (window.turnstile && turnstile.getResponse()) || null; } catch(e) { return null; }")
-            if turnstileResponse:
-                print(f"[*] Turnstile 已自动通过，获取到 Token: {turnstileResponse[:20]}...")
-                return turnstileResponse
+            # ── Step 1: 检查 cf-turnstile-response 是否已经有值 ──
+            # 借鉴 Turnstile-Solver 的 _get_turnstile_response：先查 input value
+            token_value = page.run_js("""
+                try {
+                    // 方式 A：通过 Turnstile JS API
+                    if (window.turnstile) {
+                        var resp = turnstile.getResponse();
+                        if (resp) return resp;
+                    }
+                    // 方式 B：直接读取隐藏 input 的值
+                    var el = document.querySelector('[name="cf-turnstile-response"]');
+                    if (el && el.value && el.value.trim()) return el.value.trim();
+                    return null;
+                } catch(e) { return null; }
+            """)
+            if token_value:
+                print(f"[*] Turnstile 已通过，获取到 Token: {token_value[:30]}...")
+                return token_value
 
-            # 2. 查找 Turnstile 容器
-            challengeSolution = page.ele("@name=cf-turnstile-response", timeout=1)
-            if not challengeSolution:
-                # 尝试通过 querySelector 找可能的 container
-                if i % 10 == 0:
-                    print(f"[*] 等待 Turnstile 组件加载... (第 {i} 秒)")
-                time.sleep(1)
-                continue
-
-            challengeWrapper = challengeSolution.parent()
-            if not challengeWrapper:
-                time.sleep(1)
-                continue
-
-            # 3. 进入 Shadow Root 查找 iframe
-            sr = challengeWrapper.shadow_root
-            if not sr:
-                # print("[Debug] 未找到 challengeWrapper 的 shadow_root")
-                time.sleep(1)
-                continue
-
-            challengeIframe = sr.ele("tag:iframe", timeout=1)
-            if not challengeIframe:
-                # print("[Debug] Shadow root 内未找到 iframe")
-                time.sleep(1)
-                continue
-
-            # 4. 在 iframe 内模拟真人属性并点击
-            # 注入 MouseEvent 模拟，绕过部分 headless 检测
-            challengeIframe.run_js("""
-                window.dtp = 1;
-                if (!window.MouseEvent.prototype.hasOwnProperty('_mocked')) {
-                    const getRandomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-                    let sX = getRandomInt(800, 1200);
-                    let sY = getRandomInt(400, 600);
-                    Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sX });
-                    Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sY });
-                    MouseEvent.prototype._mocked = true;
-                }
+            # ── Step 2: 尝试通过 JS API 主动触发 ──
+            page.run_js("""
+                try {
+                    if (window.turnstile) {
+                        // 尝试 execute，让 Turnstile 主动开始挑战
+                        var containers = document.querySelectorAll('.cf-turnstile');
+                        if (containers.length > 0) {
+                            turnstile.execute(containers[0]);
+                        }
+                    }
+                } catch(e) { }
             """)
 
-            # 5. 查找 iframe 内的 checkbox 并点击
-            # Cloudflare 的 iframe 内部结构可能有自己的 shadow root 或简单 body
-            iframe_body = challengeIframe.ele("tag:body", timeout=1)
-            if not iframe_body:
-                time.sleep(1)
-                continue
-
-            # 这里的选择器需要兼容性：有时是 input, 有时是 span#success-icon 附近的 div
-            # 我们直接找可见的 input 或者具有特定类名的元素
-            checkbox = iframe_body.ele("tag:input", timeout=1) or \
-                       iframe_body.ele("#challenge-stage", timeout=1)
-            
-            if checkbox:
+            # ── Step 3: 借鉴 Solver 的外层点击法 —— 直接点击 div.cf-turnstile 容器 ──
+            # Turnstile-Solver 的做法：page.click("//div[@class='cf-turnstile']")
+            # 这里用 DrissionPage 等价实现
+            turnstile_container = page.ele(".cf-turnstile", timeout=1)
+            if turnstile_container:
                 if i % 5 == 0:
-                    print("[*] 检测到 Turnstile 验证框，尝试点击...")
-                checkbox.click()
+                    print(f"[*] 尝试点击 Turnstile 外层容器... (第 {i + 1}/{max_retries} 次)")
+                turnstile_container.click()
             else:
-                # 如果没找到明确的 checkbox，尝试点击整个 body 中心
-                if i % 5 == 0:
-                    print("[*] 未找到明确 Checkbox，尝试点击 Iframe 中心...")
-                iframe_body.click()
+                # 如果 class 选择器找不到，尝试通过 cf-turnstile-response 的父级链定位
+                challenge_input = page.ele("@name=cf-turnstile-response", timeout=1)
+                if challenge_input:
+                    wrapper = challenge_input.parent()
+                    if wrapper:
+                        parent_of_wrapper = wrapper.parent()
+                        click_target = parent_of_wrapper or wrapper
+                        if i % 5 == 0:
+                            print(f"[*] 通过父级链定位，尝试点击 Turnstile 容器... (第 {i + 1}/{max_retries} 次)")
+                        click_target.click()
+                    else:
+                        if i % 5 == 0:
+                            print(f"[*] 等待 Turnstile 容器可用... (第 {i + 1}/{max_retries} 次)")
+                else:
+                    if i % 10 == 0:
+                        print(f"[*] 等待 Turnstile 组件加载... (第 {i + 1}/{max_retries} 次)")
+
+            # ── Step 4 (可选): 尝试在 Iframe 内注入 MouseEvent 补丁 ──
+            # 保留对 iframe 的 screenX/Y 注入，但不再依赖是否成功
+            try:
+                challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.5)
+                if challenge_input:
+                    wrapper = challenge_input.parent()
+                    if wrapper:
+                        sr = wrapper.shadow_root
+                        if sr:
+                            iframe = sr.ele("tag:iframe", timeout=0.5)
+                            if iframe:
+                                iframe.run_js("""
+                                    try {
+                                        if (!window.MouseEvent.prototype.hasOwnProperty('_mocked')) {
+                                            const getRandomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+                                            let sX = getRandomInt(800, 1200);
+                                            let sY = getRandomInt(400, 600);
+                                            Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sX });
+                                            Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sY });
+                                            MouseEvent.prototype._mocked = true;
+                                        }
+                                    } catch(e) {}
+                                """)
+            except Exception:
+                pass
 
         except Exception as e:
-            if i % 10 == 0:
+            if i % 5 == 0:
                 print(f"[Debug] Turnstile 尝试中遇到异常: {e}")
-            pass
-        
-        time.sleep(1)
 
-    raise Exception("failed to solve turnstile after 30 seconds")
+        time.sleep(1.5)
+
+    # 超时后输出 DOM 快照帮助排查
+    try:
+        debug_info = page.run_js("""
+            var el = document.querySelector('[name="cf-turnstile-response"]');
+            var containers = document.querySelectorAll('.cf-turnstile');
+            return {
+                url: location.href,
+                hasTurnstileInput: !!el,
+                turnstileInputValue: el ? (el.value || '').substring(0, 30) : '',
+                containerCount: containers.length,
+                hasTurnstileAPI: !!window.turnstile,
+                iframes: Array.from(document.querySelectorAll('iframe')).map(f => ({src: f.src || '', width: f.width, height: f.height})).slice(0, 5)
+            };
+        """)
+        print(f"[Debug] Turnstile 超时，DOM 快照: {debug_info}")
+    except Exception:
+        pass
+
+    raise Exception("Turnstile 验证超时，30 秒内未获取到 Token")
 
 
 def build_profile():
