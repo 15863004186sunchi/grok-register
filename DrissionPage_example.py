@@ -10,6 +10,8 @@ import os
 import secrets
 import sys
 
+import re
+import json
 from email_register import get_email_and_token, get_oai_code
 from YesCaptcha_service import TurnstileService
 
@@ -1056,7 +1058,37 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     open_signup_page()
     email, dev_token = fill_email_and_submit()
     fill_code_and_submit(email, dev_token)
+    
+    # ── 开启网络监听，捕获注册提交后的状态变化 ──
+    # x.ai 注册成功后会返回一个包含 set-cookie URL 的响应体
+    page.listen.start('sign-up')
+    
     profile = fill_profile_and_submit()
+    
+    # ── 等待捕获 sign-up 接口响应 ──
+    print("[*] 正在捕获注册接口响应以提取 Set-Cookie URL...")
+    packet = page.listen.wait(timeout=20)
+    if packet:
+        try:
+            body = packet.response.body
+            if isinstance(body, bytes):
+                body = body.decode('utf-8', errors='ignore')
+            
+            # 使用 grok.py 中的正则提取 set-cookie 链接
+            # 格式通常为: (https://...set-cookie?q=...)1:
+            match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', body)
+            if match:
+                verify_url = match.group(1)
+                print(f"[*] 成功提取到 Set-Cookie URL: {verify_url}")
+                print("[*] 正在手动执行 Cookie 写入重定向...")
+                page.get(verify_url)
+            else:
+                print("[Debug] 响应体中未直接发现 set-cookie 模式，尝试依靠浏览器自身跳转。")
+        except Exception as e:
+            print(f"[Debug] 解析响应体失败: {e}")
+    else:
+        print("[Debug] 未捕获到 sign-up 接口响应，将继续通过 Cookie 轮询。")
+
     sso_value = wait_for_sso_cookie()
     append_sso_to_txt(sso_value, output_path)
 
