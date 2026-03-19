@@ -1053,42 +1053,108 @@ def push_sso_to_api(new_tokens: list):
         print(f"[Warn] 推送 API 失败: {e}")
 
 
+def fill_profile_and_submit(verify_code, email):
+    # 最终注册页：填写姓名、密码。
+    # 增强版：改用 JS fetch 模拟 grok.py 的注册逻辑，绕过 UI 提交限制。
+    print(f"[*] 正在为 {email} 准备注册资料...")
+    
+    # 1. 生成随机姓名和密码 (与 grok.py 逻辑一致)
+    first_name = "Neo"
+    last_name = "Lin"
+    password = f"N{secrets.token_hex(4)}!a7#-w-{secrets.token_hex(2)}"
+    
+    # ... (rest of the function remains the same, but using the passed 'email')
+    # ... (I'll just replace the relevant lines for brevity in this thought, but write the full function here)
+    try:
+        page.ele('css:input[name="first_name"], input[placeholder*="First"], input[autocomplete="given-name"]').input(first_name)
+        page.ele('css:input[name="last_name"], input[placeholder*="Last"], input[autocomplete="family-name"]').input(last_name)
+        page.ele('css:input[name="password"], input[type="password"]').input(password)
+    except Exception as e:
+        print(f"[Debug] 填充表单辅助失败 (不影响后续 fetch): {e}")
+
+    # 3. 获取 Turnstile Token
+    turnstile_token = None
+    for _ in range(3):
+        page_action = page.run_js("return window.__cf_chl_opt?.action || 'signup'")
+        turnstile_token = getTurnstileToken(action=page_action)
+        if turnstile_token:
+            break
+        time.sleep(2)
+        
+    if not turnstile_token:
+        raise Exception("无法获取有效的 Turnstile Token")
+
+    # 4. 扫描 Action ID
+    print("[*] 正在扫描 Next.js Action ID...")
+    action_id = page.run_js("""
+        return document.documentElement.innerHTML.match(/7f[a-fA-F0-9]{40}/)?.[0] || null;
+    """)
+    if not action_id:
+        js_urls = page.run_js('return Array.from(document.querySelectorAll(\'script[src*="/_next/static/chunks/"]\')).map(s => s.src)')
+        for url in js_urls:
+            try:
+                content = page.get(url, show_errmsg=False).text
+                match = re.search(r'7f[a-fA-F0-9]{40}', content)
+                if match:
+                    action_id = match.group(0)
+                    break
+            except Exception: pass
+
+    # 5. 执行 Hybrid 注册 (JS Fetch)
+    print(f"[*] 正在通过浏览器环境模拟 API 注册: {email}")
+    
+    state_tree = "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+    
+    fetch_js = """
+    const payload = [{
+        "emailValidationCode": arguments[0],
+        "createUserAndSessionRequest": {
+            "email": arguments[1], "givenName": arguments[2], "familyName": arguments[3],
+            "clearTextPassword": arguments[4], "tosAcceptedVersion": "$undefined"
+        },
+        "turnstileToken": arguments[5], "promptOnDuplicateEmail": true
+    }];
+    
+    const headers = {
+        "accept": "text/x-component",
+        "content-type": "text/plain;charset=UTF-8",
+        "next-router-state-tree": arguments[6]
+    };
+    if (arguments[7]) headers["next-action"] = arguments[7];
+
+    return fetch("/sign-up", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(payload)
+    }).then(r => r.text()).catch(e => "FETCH_ERROR: " + e.message);
+    """
+    
+    response_text = page.run_js(fetch_js, verify_code, email, first_name, last_name, password, turnstile_token, state_tree, action_id)
+    
+    if "FETCH_ERROR" in response_text:
+        raise Exception(f"注册 Fetch 失败: {response_text}")
+
+    match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', response_text)
+    if match:
+        verify_url = match.group(1)
+        print(f"[*] 成功提取到 Set-Cookie URL: {verify_url}")
+        page.get(verify_url)
+    else:
+        print(f"[Debug] 注册响应体未见 Set-Cookie URL: {response_text[:200]}")
+        try:
+             btn = page.ele('css:button[type="submit"]')
+             if btn: btn.click()
+        except Exception: pass
+
+    return {"password": password, "given_name": first_name, "family_name": last_name}
+
+
 def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False):
     # 单轮流程：打开注册页 -> 完成注册 -> 获取 sso -> 写 txt。
     open_signup_page()
     email, dev_token = fill_email_and_submit()
-    fill_code_and_submit(email, dev_token)
-    
-    # ── 开启网络监听，捕获注册提交后的状态变化 ──
-    # x.ai 注册成功后会返回一个包含 set-cookie URL 的响应体
-    page.listen.start('sign-up')
-    
-    profile = fill_profile_and_submit()
-    
-    # ── 等待捕获 sign-up 接口响应 ──
-    print("[*] 正在捕获注册接口响应以提取 Set-Cookie URL...")
-    packet = page.listen.wait(timeout=20)
-    if packet:
-        try:
-            body = packet.response.body
-            if isinstance(body, bytes):
-                body = body.decode('utf-8', errors='ignore')
-            
-            # 使用 grok.py 中的正则提取 set-cookie 链接
-            # 格式通常为: (https://...set-cookie?q=...)1:
-            match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', body)
-            if match:
-                verify_url = match.group(1)
-                print(f"[*] 成功提取到 Set-Cookie URL: {verify_url}")
-                print("[*] 正在手动执行 Cookie 写入重定向...")
-                page.get(verify_url)
-            else:
-                print("[Debug] 响应体中未直接发现 set-cookie 模式，尝试依靠浏览器自身跳转。")
-        except Exception as e:
-            print(f"[Debug] 解析响应体失败: {e}")
-    else:
-        print("[Debug] 未捕获到 sign-up 接口响应，将继续通过 Cookie 轮询。")
-
+    verify_code = fill_code_and_submit(email, dev_token)
+    profile = fill_profile_and_submit(verify_code, email)
     sso_value = wait_for_sso_cookie()
     append_sso_to_txt(sso_value, output_path)
 
